@@ -4,39 +4,47 @@ import pickle
 import numpy as np
 import re
 
-# =========================
+# =============================================================================
 # LOAD MODELS
-# =========================
-cnn_model = tf.keras.models.load_model("cnn_anomaly_detector.keras")
-lstm_model = tf.keras.models.load_model("lstm_anomaly_detector.keras")
-cnn_lstm_model = tf.keras.models.load_model("cnn_lstm_anomaly_detector.keras")
+# =============================================================================
+@st.cache_resource
+def load_models():
+    bgl = {
+        "CNN":      tf.keras.models.load_model("cnn_bgl.keras"),
+        "LSTM":     tf.keras.models.load_model("lstm_bgl.keras"),
+        "CNN-LSTM": tf.keras.models.load_model("cnn_lstm_bgl.keras"),
+    }
+    hdfs = {
+        "CNN":      tf.keras.models.load_model("cnn_hdfs.keras"),
+        "LSTM":     tf.keras.models.load_model("lstm_hdfs.keras"),
+        "CNN-LSTM": tf.keras.models.load_model("cnn_lstm_hdfs.keras"),
+    }
+    return bgl, hdfs
 
-# =========================
-# LOAD TOKENIZER
-# =========================
-with open("tokenizer.pkl", "rb") as f:
-    tokenizer = pickle.load(f)
+# =============================================================================
+# LOAD TOKENIZERS & CONFIGS
+# =============================================================================
+@st.cache_resource
+def load_artifacts():
+    with open("tokenizer_bgl.pkl", "rb") as f:
+        tok_bgl = pickle.load(f)
+    with open("tokenizer_hdfs.pkl", "rb") as f:
+        tok_hdfs = pickle.load(f)
+    with open("model_config_bgl.pkl", "rb") as f:
+        cfg_bgl = pickle.load(f)
+    with open("model_config_hdfs.pkl", "rb") as f:
+        cfg_hdfs = pickle.load(f)
+    return tok_bgl, tok_hdfs, cfg_bgl, cfg_hdfs
 
-with open("model_config.pkl", "rb") as f:
-    config = pickle.load(f)
+bgl_models, hdfs_models        = load_models()
+tok_bgl, tok_hdfs, cfg_bgl, cfg_hdfs = load_artifacts()
 
-MAX_LEN = config["max_sequence_length"]
+MAX_LEN_BGL  = cfg_bgl["max_sequence_length"]
+MAX_LEN_HDFS = cfg_hdfs["max_sequence_length"]
 
-# =========================
-# STREAMLIT UI
-# =========================
-st.title("🔥 AIOps Log Anomaly Detection System")
-
-model_choice = st.selectbox(
-    "Pilih Model",
-    ["CNN", "LSTM", "CNN-LSTM"]
-)
-
-log_input = st.text_area("Masukkan Log:")
-
-# =========================
-# PREPROCESS FUNCTION
-# =========================
+# =============================================================================
+# PREPROCESSING
+# =============================================================================
 def clean_log_text(text):
     text = str(text).lower()
     text = re.sub(r'0x[0-9a-f]+', ' HEXADDR ', text)
@@ -47,36 +55,129 @@ def clean_log_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def preprocess(text):
+def preprocess(text, tokenizer, max_len):
     cleaned = clean_log_text(text)
-    seq = tokenizer.texts_to_sequences([cleaned])
-    padded = tf.keras.preprocessing.sequence.pad_sequences(seq, maxlen=MAX_LEN)
+    seq     = tokenizer.texts_to_sequences([cleaned])
+    padded  = tf.keras.utils.pad_sequences(seq, maxlen=max_len,
+                                           padding='post', truncating='post')
     return padded
 
-# =========================
-# PREDICTION
-# =========================
-def predict(text, model):
-    data = preprocess(text)
-    pred = model.predict(data)[0][0]
-    return pred
+# =============================================================================
+# ENSEMBLE PREDICTION
+# =============================================================================
+def ensemble_predict(log_text):
+    detail = []
 
-if st.button("Detect Anomaly"):
+    for model_name, model in bgl_models.items():
+        data  = preprocess(log_text, tok_bgl, MAX_LEN_BGL)
+        score = float(model.predict(data, verbose=0)[0][0])
+        detail.append({
+            "Dataset": "BGL",
+            "Model":   model_name,
+            "Score":   score,
+            "Label":   "ANOMALY" if score > 0.5 else "NORMAL",
+        })
 
-    if model_choice == "CNN":
-        model = cnn_model
-    elif model_choice == "LSTM":
-        model = lstm_model
+    for model_name, model in hdfs_models.items():
+        data  = preprocess(log_text, tok_hdfs, MAX_LEN_HDFS)
+        score = float(model.predict(data, verbose=0)[0][0])
+        detail.append({
+            "Dataset": "HDFS",
+            "Model":   model_name,
+            "Score":   score,
+            "Label":   "ANOMALY" if score > 0.5 else "NORMAL",
+        })
+
+    avg_score   = float(np.mean([d["Score"] for d in detail]))
+    n_anomaly   = sum(1 for d in detail if d["Label"] == "ANOMALY")
+    final_label = "ANOMALY" if avg_score > 0.5 else "NORMAL"
+
+    return detail, avg_score, n_anomaly, final_label
+
+# =============================================================================
+# STREAMLIT UI
+# =============================================================================
+st.set_page_config(page_title="AIOps Log Anomaly Detection", page_icon="🔥", layout="wide")
+
+st.title("🔥 AIOps Log Anomaly Detection System")
+st.caption("Ensemble: BGL + HDFS | Models: CNN · LSTM · CNN-LSTM")
+
+with st.expander("ℹ️ Informasi Model & Artifacts", expanded=False):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**BGL (BlueGene/L Supercomputer)**")
+        st.code(
+            "cnn_bgl.keras\nlstm_bgl.keras\ncnn_lstm_bgl.keras\n"
+            "tokenizer_bgl.pkl\nmodel_config_bgl.pkl"
+        )
+    with col_b:
+        st.markdown("**HDFS (Hadoop Distributed File System)**")
+        st.code(
+            "cnn_hdfs.keras\nlstm_hdfs.keras\ncnn_lstm_hdfs.keras\n"
+            "tokenizer_hdfs.pkl\nmodel_config_hdfs.pkl"
+        )
+
+st.divider()
+
+log_input = st.text_area(
+    "Masukkan Log:",
+    placeholder="Contoh: kernel: BUG: unable to handle kernel NULL pointer dereference",
+    height=120,
+)
+
+col_btn, col_info = st.columns([1, 4])
+with col_btn:
+    detect = st.button("🔍 Detect Anomaly", use_container_width=True)
+with col_info:
+    st.info(
+        "**Cara kerja ensemble:** semua 6 model (3 BGL + 3 HDFS) diprediksi, "
+        "keputusan final berdasarkan rata-rata probabilitas.",
+        icon="ℹ️",
+    )
+
+if detect:
+    if not log_input.strip():
+        st.warning("Masukkan teks log terlebih dahulu.")
     else:
-        model = cnn_lstm_model
+        with st.spinner("Menjalankan 6 model..."):
+            detail, avg_score, n_anomaly, final_label = ensemble_predict(log_input)
 
-    score = predict(log_input, model)
+        st.divider()
 
-    st.subheader("Hasil Prediksi")
+        # --- Hasil Final ---
+        st.subheader("Hasil Ensemble")
+        col1, col2, col3 = st.columns(3)
 
-    if score > 0.5:
-        st.error(f"🚨 ANOMALY (confidence: {score:.3f})")
-    else:
-        st.success(f"✅ NORMAL (confidence: {1-score:.3f})")
+        with col1:
+            if final_label == "ANOMALY":
+                st.error("🚨 **ANOMALY**")
+            else:
+                st.success("✅ **NORMAL**")
 
-    st.progress(float(score))
+        with col2:
+            st.metric("Rata-rata Probabilitas Anomaly", f"{avg_score:.4f}")
+
+        with col3:
+            st.metric("Voting Anomaly", f"{n_anomaly} / 6 model")
+
+        st.progress(avg_score, text=f"Anomaly score: {avg_score:.4f}")
+
+        # --- Detail per Model ---
+        st.divider()
+        st.subheader("Detail per Model")
+
+        col_bgl, col_hdfs = st.columns(2)
+
+        with col_bgl:
+            st.markdown("**BGL (BlueGene/L)**")
+            for d in [x for x in detail if x["Dataset"] == "BGL"]:
+                icon = "🚨" if d["Label"] == "ANOMALY" else "✅"
+                st.write(f"{icon} **{d['Model']}** — {d['Label']} `{d['Score']:.4f}`")
+                st.progress(d["Score"])
+
+        with col_hdfs:
+            st.markdown("**HDFS (Hadoop)**")
+            for d in [x for x in detail if x["Dataset"] == "HDFS"]:
+                icon = "🚨" if d["Label"] == "ANOMALY" else "✅"
+                st.write(f"{icon} **{d['Model']}** — {d['Label']} `{d['Score']:.4f}`")
+                st.progress(d["Score"])
