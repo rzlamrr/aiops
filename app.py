@@ -88,11 +88,18 @@ def ensemble_predict(log_text):
             "Label":   "ANOMALY" if score > 0.5 else "NORMAL",
         })
 
+    # Per-dataset majority vote (2/3 model setuju → dataset flagged)
+    bgl_votes  = sum(1 for d in detail if d["Dataset"] == "BGL"  and d["Label"] == "ANOMALY")
+    hdfs_votes = sum(1 for d in detail if d["Dataset"] == "HDFS" and d["Label"] == "ANOMALY")
+    bgl_flagged  = bgl_votes  >= 2
+    hdfs_flagged = hdfs_votes >= 2
+
+    # Final: ANOMALY jika salah satu dataset majority flagged (OR logic)
+    final_label = "ANOMALY" if (bgl_flagged or hdfs_flagged) else "NORMAL"
     avg_score   = float(np.mean([d["Score"] for d in detail]))
     n_anomaly   = sum(1 for d in detail if d["Label"] == "ANOMALY")
-    final_label = "ANOMALY" if avg_score > 0.5 else "NORMAL"
 
-    return detail, avg_score, n_anomaly, final_label
+    return detail, avg_score, n_anomaly, final_label, bgl_votes, hdfs_votes
 
 # =============================================================================
 # STREAMLIT UI
@@ -140,7 +147,7 @@ if detect:
         st.warning("Masukkan teks log terlebih dahulu.")
     else:
         with st.spinner("Menjalankan 6 model..."):
-            detail, avg_score, n_anomaly, final_label = ensemble_predict(log_input)
+            detail, avg_score, n_anomaly, final_label, bgl_votes, hdfs_votes = ensemble_predict(log_input)
 
         st.divider()
 
@@ -155,10 +162,12 @@ if detect:
                 st.success("✅ **NORMAL**")
 
         with col2:
-            st.metric("Rata-rata Probabilitas Anomaly", f"{avg_score:.4f}")
+            st.metric("BGL Votes", f"{bgl_votes} / 3", help="≥2 → flagged")
+            st.metric("HDFS Votes", f"{hdfs_votes} / 3", help="≥2 → flagged")
 
         with col3:
-            st.metric("Voting Anomaly", f"{n_anomaly} / 6 model")
+            st.metric("Avg Anomaly Score", f"{avg_score:.4f}")
+            st.metric("Total Votes", f"{n_anomaly} / 6 model")
 
         st.progress(avg_score, text=f"Anomaly score: {avg_score:.4f}")
 
